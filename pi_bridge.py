@@ -48,7 +48,12 @@ MIC_WAKE_WORD = "sherlock"
 MIC_DEVICE = os.environ.get("MIC_DEVICE", "hw:2,0")
 
 load_dotenv()
-voice_client = OpenAI()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    voice_client = None
+    print("[VOICE] OPENAI_API_KEY not set — transcription disabled")
+else:
+    voice_client = OpenAI()
 sd.default.device = MIC_DEVICE
 
 WAKEWORD_MODEL_PATH = str(Path(__file__).resolve().parent / "mic_test_code" / "SecondIteration" / "sherlock.onnx")
