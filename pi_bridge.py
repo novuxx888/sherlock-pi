@@ -19,6 +19,12 @@ import threading
 from datetime import datetime, timezone
 from supabase import create_client
 import serial
+import sounddevice as sd
+import soundfile as sf
+from dotenv import load_dotenv
+from openai import OpenAI
+from openwakeword.model import Model
+from pathlib import Path
 
 # --- CONFIG ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "YOUR_SUPABASE_URL")
@@ -26,22 +32,36 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "YOUR_SUPABASE_ANON_KEY")
 ESP32_STREAM_URL = "http://192.168.137.123:81/stream"
 BRAIN_FILE = os.path.expanduser("~/known_faces.pkl")
 POLL_INTERVAL = 2  # seconds
+CONTROL_POLL_INTERVAL = 5  # seconds
 COSINE_THRESHOLD = 0.35
 
 # UART config for ESP-NOW hub
 UART_PORT = "/dev/ttyAMA0"
 UART_BAUD = 1200
 
+MIC_SAMPLE_RATE = 48000
+MIC_RECORDING_DURATION = 5
+MIC_AUDIO_FILE = "/tmp/sherlock_voice_capture.wav"
+MIC_OUTPUT_TEXT_FILE = "/tmp/sherlock_voice_transcription.txt"
+MIC_WAKE_THRESHOLD = 0.5
+MIC_WAKE_WORD = "sherlock"
+MIC_DEVICE = os.environ.get("MIC_DEVICE", "hw:2,0")
+
+load_dotenv()
+voice_client = OpenAI()
+sd.default.device = MIC_DEVICE
+
+WAKEWORD_MODEL_PATH = str(Path(__file__).resolve().parent / "mic_test_code" / "SecondIteration" / "sherlock.onnx")
+_wakeword_model = Model(wakeword_model_paths=[WAKEWORD_MODEL_PATH])
+
 # --- INIT SUPABASE ---
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- LOAD FACE RECOGNITION ---
-import insightface
-from insightface.app import FaceAnalysis
-
-print("Loading face recognition model...")
-face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
-face_app.prepare(ctx_id=0, det_size=(320, 320))
+control_state = {
+    "sensor_upload_enabled": False,
+    "capture_upload_enabled": False,
+}
+control_state_lock = threading.Lock()
 
 try:
     with open(BRAIN_FILE, "rb") as f:
@@ -54,6 +74,14 @@ except Exception as e:
     print(f"WARNING: No brain file found. Recognition disabled.")
     known_embeddings = None
     known_names = None
+
+# --- LOAD FACE RECOGNITION ---
+import insightface
+from insightface.app import FaceAnalysis
+
+print("Loading face recognition model...")
+face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
+face_app.prepare(ctx_id=0, det_size=(320, 320))
 
 
 def normalize_frame(frame):
@@ -77,6 +105,157 @@ def recognize_face(embedding):
     best_name = max(person_scores, key=person_scores.get)
     best_sim = person_scores[best_name]
     return best_name, best_sim, person_scores
+
+
+def get_control_setting(name):
+    with control_state_lock:
+        return control_state.get(name, True)
+
+
+def refresh_control_state():
+    try:
+        result = supabase.table("device_settings") \
+            .select("*") \
+            .eq("id", "pi") \
+            .limit(1) \
+            .execute()
+
+        if result.data:
+            settings = result.data[0]
+            with control_state_lock:
+                control_state["sensor_upload_enabled"] = settings.get("sensor_upload_enabled", False)
+                control_state["capture_upload_enabled"] = settings.get("capture_upload_enabled", False)
+    except Exception as e:
+        print(f"[CONTROL] Failed to refresh settings: {e}")
+
+
+def ensure_control_state_row():
+    try:
+        supabase.table("device_settings").upsert({
+            "id": "pi",
+            "sensor_upload_enabled": False,
+            "capture_upload_enabled": False,
+        }).execute()
+    except Exception as e:
+        print(f"[CONTROL] Failed to initialize control state: {e}")
+
+
+def update_control_setting(setting_name, enabled):
+    try:
+        payload = {
+            "id": "pi",
+            setting_name: bool(enabled),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table("device_settings").upsert(payload).execute()
+        with control_state_lock:
+            control_state[setting_name] = bool(enabled)
+        print(f"[CONTROL] {setting_name} set to {enabled}")
+        return True
+    except Exception as e:
+        print(f"[CONTROL] Failed to update {setting_name}: {e}")
+        return False
+
+
+def record_and_transcribe():
+    print(f"[VOICE] Recording {MIC_RECORDING_DURATION}s of audio...")
+    try:
+        audio_data = sd.rec(
+            int(MIC_SAMPLE_RATE * MIC_RECORDING_DURATION),
+            samplerate=MIC_SAMPLE_RATE,
+            channels=2,
+            dtype="int32",
+        )
+        sd.wait()
+        sf.write(MIC_AUDIO_FILE, audio_data, MIC_SAMPLE_RATE)
+
+        with open(MIC_AUDIO_FILE, "rb") as audio_file_obj:
+            transcription = voice_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file_obj,
+                language="en",
+            )
+
+        result_text = transcription.text.strip()
+        with open(MIC_OUTPUT_TEXT_FILE, "w", encoding="utf-8") as output_file:
+            output_file.write(result_text)
+
+        print(f"[VOICE] Transcription: {result_text}")
+        return result_text
+    except Exception as e:
+        print(f"[VOICE] Transcription failed: {e}")
+        return ""
+
+
+def interpret_voice_command(text):
+    normalized = text.lower().strip()
+    if not normalized:
+        return None
+
+    if ("camera" in normalized or "capture" in normalized) and ("turn on" in normalized or "camera on" in normalized or "enable" in normalized or "start" in normalized):
+        return ("capture_upload_enabled", True)
+
+    if ("camera" in normalized or "capture" in normalized) and ("turn off" in normalized or "camera off" in normalized or "disable" in normalized or "stop" in normalized):
+        return ("capture_upload_enabled", False)
+
+    if ("sensor" in normalized or "sensor readings" in normalized or "readings" in normalized) and ("turn on" in normalized or "sensor on" in normalized or "enable" in normalized or "start" in normalized):
+        return ("sensor_upload_enabled", True)
+
+    if ("sensor" in normalized or "sensor readings" in normalized or "readings" in normalized) and ("turn off" in normalized or "sensor off" in normalized or "disable" in normalized or "stop" in normalized):
+        return ("sensor_upload_enabled", False)
+
+    return None
+
+
+def wakeword_listener(channels=2):
+    wake_word_detected = False
+
+    def audio_callback(indata, frames, time_info, status):
+        nonlocal wake_word_detected
+        if status:
+            print(status, flush=True)
+
+        audio_16k_mono = indata[::3, 0]
+        prediction = _wakeword_model.predict(audio_16k_mono)
+        if prediction.get(MIC_WAKE_WORD, 0) > MIC_WAKE_THRESHOLD:
+            wake_word_detected = True
+            _wakeword_model.reset()
+
+    with sd.InputStream(samplerate=MIC_SAMPLE_RATE, channels=channels, blocksize=3840, dtype="int16", callback=audio_callback):
+        while not wake_word_detected:
+            sd.sleep(100)
+
+    return True
+
+
+def mic_command_thread():
+    try:
+        default_input = sd.default.device[0]
+        device_info = sd.query_devices(default_input, "input")
+        channels = int(device_info.get("max_input_channels", 2)) or 2
+    except Exception as e:
+        print(f"[VOICE] Could not query mic channels, defaulting to 2: {e}")
+        channels = 2
+
+    print("[VOICE] Mic control ready. Say 'sherlock' to issue a command.")
+    while True:
+        try:
+            print(f"[VOICE] Listening for wake word '{MIC_WAKE_WORD}'...")
+            if wakeword_listener(channels=channels):
+                print("[VOICE] Wake word detected.")
+                transcript = record_and_transcribe()
+                command = interpret_voice_command(transcript)
+
+                if command is None:
+                    print("[VOICE] No supported command detected.")
+                    continue
+
+                setting_name, enabled = command
+                update_control_setting(setting_name, enabled)
+
+        except Exception as e:
+            print(f"[VOICE] Mic command loop error: {e}")
+            time.sleep(1)
 
 
 def grab_single_frame():
@@ -109,6 +288,10 @@ def grab_single_frame():
 
 def capture_and_upload():
     """Grab a single frame, run recognition, upload to Supabase."""
+    if not get_control_setting("capture_upload_enabled"):
+        print("[CAPTURE] Uploads disabled — skipping capture upload")
+        return
+
     print("[CAPTURE] Grabbing frame from ESP32...")
     frame = grab_single_frame()
 
@@ -276,14 +459,17 @@ def uart_reader_thread():
                 print(f"\n[SENSOR] {mac} | Temp: {temperature:.1f}°C | Humidity: {humidity:.1f}% | Pressure: {pressure:.1f} hPa")
 
                 try:
-                    supabase.table("sensor_data").insert({
-                        "mac_address": mac,
-                        "data_type": "environment",
-                        "temperature": round(temperature, 2),
-                        "humidity": round(humidity, 2),
-                        "pressure": round(pressure, 2),
-                        "leak_detected": False
-                    }).execute()
+                    if get_control_setting("sensor_upload_enabled"):
+                        supabase.table("sensor_data").insert({
+                            "mac_address": mac,
+                            "data_type": "environment",
+                            "temperature": round(temperature, 2),
+                            "humidity": round(humidity, 2),
+                            "pressure": round(pressure, 2),
+                            "leak_detected": False
+                        }).execute()
+                    else:
+                        print("[UART] Sensor uploads disabled — skipping environment packet")
                 except Exception as e:
                     print(f"[UART] Supabase upload error: {e}")
 
@@ -297,11 +483,14 @@ def uart_reader_thread():
                 print(f"\n[LEAK ALERT] {mac} - LEAK DETECTED!")
 
                 try:
-                    supabase.table("sensor_data").insert({
-                        "mac_address": mac,
-                        "data_type": "leak",
-                        "leak_detected": True
-                    }).execute()
+                    if get_control_setting("sensor_upload_enabled"):
+                        supabase.table("sensor_data").insert({
+                            "mac_address": mac,
+                            "data_type": "leak",
+                            "leak_detected": True
+                        }).execute()
+                    else:
+                        print("[UART] Sensor uploads disabled — skipping leak packet")
                 except Exception as e:
                     print(f"[UART] Supabase upload error: {e}")
 
@@ -318,10 +507,15 @@ def main():
     print(f"Supabase polling every {POLL_INTERVAL}s")
     print(f"Camera: on-demand capture (no continuous stream)\n")
 
+    ensure_control_state_row()
+    refresh_control_state()
+
     # Start background threads
     threading.Thread(target=poll_commands_thread, daemon=True).start()
     threading.Thread(target=heartbeat_thread, daemon=True).start()
+    threading.Thread(target=_control_state_thread, daemon=True).start()
     threading.Thread(target=uart_reader_thread, daemon=True).start()
+    threading.Thread(target=mic_command_thread, daemon=True).start()
 
     print("[READY] Waiting for commands. Ctrl+C to quit.\n")
 
@@ -330,6 +524,13 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nShutting down...")
+
+
+def _control_state_thread():
+    """Background thread that polls the desired upload settings."""
+    while True:
+        refresh_control_state()
+        time.sleep(CONTROL_POLL_INTERVAL)
 
 
 if __name__ == "__main__":
