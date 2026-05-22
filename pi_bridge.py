@@ -56,8 +56,12 @@ else:
     voice_client = OpenAI()
 sd.default.device = MIC_DEVICE
 
-WAKEWORD_MODEL_PATH = str(Path(__file__).resolve().parent / "mic_test_code" / "SecondIteration" / "sherlock.tflite")
-_wakeword_model = Model(wakeword_models=[WAKEWORD_MODEL_PATH])
+WAKEWORD_MODEL_PATH = str(Path(__file__).resolve().parent / "mic_test_code" / "SecondIteration" / "sherlock.onnx")
+_wakeword_model = None
+try:
+    _wakeword_model = Model(wakeword_models=[WAKEWORD_MODEL_PATH], inference_framework="onnx")
+except Exception as e:
+    print(f"[VOICE] Wake-word disabled: {e}")
 
 # --- INIT SUPABASE ---
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -226,6 +230,9 @@ def interpret_voice_command(text):
 
 
 def wakeword_listener(channels=2):
+    if _wakeword_model is None:
+        return False
+
     wake_word_detected = False
 
     def audio_callback(indata, frames, time_info, status):
@@ -250,6 +257,10 @@ def mic_command_thread():
     channels = resolve_mic_channels()
     if channels is None:
         print("[VOICE] Voice control disabled because no microphone input is available.")
+        return
+
+    if _wakeword_model is None:
+        print("[VOICE] Voice control disabled because wake-word model could not load.")
         return
 
     print("[VOICE] Mic control ready. Say 'sherlock' to issue a command.")
