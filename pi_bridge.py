@@ -56,8 +56,8 @@ else:
     voice_client = OpenAI()
 sd.default.device = MIC_DEVICE
 
-WAKEWORD_MODEL_PATH = str(Path(__file__).resolve().parent / "mic_test_code" / "SecondIteration" / "sherlock.onnx")
-_wakeword_model = Model(wakeword_model_paths=[WAKEWORD_MODEL_PATH])
+WAKEWORD_MODEL_PATH = str(Path(__file__).resolve().parent / "mic_test_code" / "SecondIteration" / "sherlock.tflite")
+_wakeword_model = Model(wakeword_models=[WAKEWORD_MODEL_PATH])
 
 # --- INIT SUPABASE ---
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
