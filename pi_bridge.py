@@ -187,6 +187,19 @@ def record_and_transcribe():
         return ""
 
 
+def resolve_mic_channels():
+    try:
+        default_input = sd.default.device[0]
+        device_info = sd.query_devices(default_input, "input")
+        channels = int(device_info.get("max_input_channels", 0) or 0)
+        if channels <= 0:
+            raise RuntimeError("No input channels available")
+        return channels
+    except Exception as e:
+        print(f"[VOICE] Mic unavailable: {e}")
+        return None
+
+
 def interpret_voice_command(text):
     normalized = text.lower().strip()
     if not normalized:
@@ -229,13 +242,10 @@ def wakeword_listener(channels=2):
 
 
 def mic_command_thread():
-    try:
-        default_input = sd.default.device[0]
-        device_info = sd.query_devices(default_input, "input")
-        channels = int(device_info.get("max_input_channels", 2)) or 2
-    except Exception as e:
-        print(f"[VOICE] Could not query mic channels, defaulting to 2: {e}")
-        channels = 2
+    channels = resolve_mic_channels()
+    if channels is None:
+        print("[VOICE] Voice control disabled because no microphone input is available.")
+        return
 
     print("[VOICE] Mic control ready. Say 'sherlock' to issue a command.")
     while True:
