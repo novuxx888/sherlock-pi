@@ -214,16 +214,38 @@ def interpret_voice_command(text):
     if not normalized:
         return None
 
-    if ("camera" in normalized or "capture" in normalized) and ("turn on" in normalized or "camera on" in normalized or "enable" in normalized or "start" in normalized):
+    words = normalized.replace(".", " ").replace(",", " ").split()
+    word_set = set(words)
+
+    def has_target(*targets):
+        return any(target in normalized for target in targets)
+
+    def wants_enable():
+        return (
+            "on" in word_set
+            or "enable" in word_set
+            or "start" in word_set
+            or ("turn" in word_set and "on" in word_set)
+        )
+
+    def wants_disable():
+        return (
+            "off" in word_set
+            or "disable" in word_set
+            or "stop" in word_set
+            or ("turn" in word_set and "off" in word_set)
+        )
+
+    if has_target("camera", "capture") and wants_enable():
         return ("capture_upload_enabled", True)
 
-    if ("camera" in normalized or "capture" in normalized) and ("turn off" in normalized or "camera off" in normalized or "disable" in normalized or "stop" in normalized):
+    if has_target("camera", "capture") and wants_disable():
         return ("capture_upload_enabled", False)
 
-    if ("sensor" in normalized or "sensor readings" in normalized or "readings" in normalized) and ("turn on" in normalized or "sensor on" in normalized or "enable" in normalized or "start" in normalized):
+    if has_target("sensor", "sensor readings", "readings") and wants_enable():
         return ("sensor_upload_enabled", True)
 
-    if ("sensor" in normalized or "sensor readings" in normalized or "readings" in normalized) and ("turn off" in normalized or "sensor off" in normalized or "disable" in normalized or "stop" in normalized):
+    if has_target("sensor", "sensor readings", "readings") and wants_disable():
         return ("sensor_upload_enabled", False)
 
     return None
